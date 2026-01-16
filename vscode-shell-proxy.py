@@ -24,9 +24,15 @@ import logging
 import threading
 import argparse
 import subprocess
+import json
+import uuid
+import shlex
+import contextlib
+import fcntl
 import re
 import sys
 import os
+import getpass
 from enum import Enum
 
 # This is the local TCP port on which this script is listening:
@@ -54,6 +60,7 @@ localhostFixupCLIListenArgsRegex = re.compile(
 localhostFixupCLICmdRegex = re.compile(
     r"(VSCODE_CLI_REQUIRE_TOKEN=[0-9a-fA-F-]*.*\$CLI_PATH.*command-shell )(.*)(--on-host=(([0-9][0-9]*\.){3}[0-9][0-9]*))"
 )
+sessionKeySanitizeRegex = re.compile(r"[^A-Za-z0-9_.-]+")
 
 # Any commands this script itself sends to the remote shell should have their output
 # prefixed with this text to indicate they are NOT in response to VSCode application
@@ -65,6 +72,14 @@ DEFAULT_BYTE_LIMIT = 4096
 
 # Default connection acceptance backlog count:
 DEFAULT_BACKLOG = 8
+
+# Persistent session defaults:
+DEFAULT_SESSION_STATE_DIR = "~/.slurm-connect"
+DEFAULT_SESSION_IDLE_TIMEOUT = 0
+DEFAULT_SESSION_HEARTBEAT_SECONDS = 30
+DEFAULT_SESSION_STALE_SECONDS = 90
+DEFAULT_SESSION_JOB_NAME = "slurm-connect"
+DEFAULT_SESSION_WAIT_SECONDS = 300
 
 
 # --- TaskGroup compatibility (Python < 3.11) -------------------------------
@@ -422,8 +437,282 @@ def stdoutProxyThread(faucet, copyToFile=None):
         proxyStateCond.notify_all()
 
 
+def normalize_session_mode(value):
+    return "persistent" if value == "persistent" else "ephemeral"
+
+
+def sanitize_session_key(value):
+    trimmed = (value or "").strip()
+    if not trimmed:
+        return "default"
+    sanitized = sessionKeySanitizeRegex.sub("-", trimmed).strip(".-")
+    if not sanitized:
+        return "default"
+    return sanitized[:64]
+
+
+def resolve_state_dir(value):
+    base = value or DEFAULT_SESSION_STATE_DIR
+    return os.path.abspath(os.path.expanduser(base))
+
+
+def get_current_user():
+    try:
+        return os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def file_lock(lock_path):
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def get_session_paths(session_key):
+    base_dir = resolve_state_dir(cliArgs.sessionStateDir)
+    safe_key = sanitize_session_key(session_key)
+    user = get_current_user() or "unknown"
+    safe_user = sanitize_session_key(user)
+    sessions_root = os.path.join(base_dir, "sessions")
+    namespaced_dir = os.path.join(sessions_root, safe_user, safe_key)
+    legacy_dir = os.path.join(sessions_root, safe_key)
+    def build_paths(session_dir):
+        return {
+            "session_dir": session_dir,
+            "clients_dir": os.path.join(session_dir, "clients"),
+            "job_path": os.path.join(session_dir, "job.json"),
+            "lock_path": os.path.join(session_dir, "lock"),
+        }
+    return {
+        "safe_key": safe_key,
+        "safe_user": safe_user,
+        "namespaced": build_paths(namespaced_dir),
+        "legacy": build_paths(legacy_dir),
+    }
+
+
+def read_job_state(job_path):
+    try:
+        with open(job_path, "r") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def write_job_state(job_path, state):
+    tmp_path = job_path + ".tmp"
+    with open(tmp_path, "w") as handle:
+        json.dump(state, handle)
+    os.replace(tmp_path, job_path)
+
+
+def query_job_state(job_id):
+    if not job_id:
+        return None
+    result = subprocess.run(
+        ["squeue", "-h", "-j", str(job_id), "-o", "%T"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        output = result.stdout.strip()
+        if output:
+            return output.splitlines()[0].strip().upper()
+
+    result = subprocess.run(
+        ["scontrol", "show", "job", "-o", str(job_id)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = re.search(r"JobState=([A-Za-z]+)", result.stdout)
+    return match.group(1).upper() if match else None
+
+
+def is_job_alive(job_id):
+    state = query_job_state(job_id)
+    if not state:
+        return False
+    return state in {"RUNNING", "PENDING", "CONFIGURING"}
+
+
+def wait_for_job_running(job_id, timeout_seconds):
+    if timeout_seconds is None:
+        timeout_seconds = DEFAULT_SESSION_WAIT_SECONDS
+    if timeout_seconds <= 0:
+        return True
+    terminal_states = {
+        "CANCELLED",
+        "COMPLETED",
+        "FAILED",
+        "TIMEOUT",
+        "NODE_FAIL",
+        "PREEMPTED",
+        "BOOT_FAIL",
+        "OUT_OF_MEMORY",
+    }
+    deadline = time.time() + timeout_seconds
+    last_state = None
+    while True:
+        state = query_job_state(job_id) or "UNKNOWN"
+        if state == "RUNNING":
+            return True
+        if state in terminal_states:
+            logging.error("Job %s ended before running (state %s).", job_id, state)
+            return False
+        now = time.time()
+        if now >= deadline:
+            logging.error(
+                "Timed out waiting for job %s to start (last state %s).",
+                job_id,
+                state,
+            )
+            return False
+        if state != last_state:
+            logging.info("Waiting for job %s to start (state %s).", job_id, state)
+            last_state = state
+        time.sleep(2)
+
+
+def build_idle_monitor_script(session_dir, idle_timeout, stale_seconds):
+    safe_dir = shlex.quote(session_dir)
+    idle_value = int(idle_timeout)
+    stale_value = int(stale_seconds)
+    return (
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        f"SESSION_DIR={safe_dir}\n"
+        'CLIENTS="$SESSION_DIR/clients"\n'
+        f"IDLE_TIMEOUT={idle_value}\n"
+        f"STALE_SECONDS={stale_value}\n"
+        'STALE_MINUTES=$(( (STALE_SECONDS + 59) / 60 ))\n'
+        'mkdir -p "$CLIENTS"\n'
+        "last_seen=$(date +%s)\n"
+        "while true; do\n"
+        "  now=$(date +%s)\n"
+        '  if [ "$STALE_SECONDS" -gt 0 ] && [ "$STALE_MINUTES" -gt 0 ]; then\n'
+        '    find "$CLIENTS" -type f -mmin +$STALE_MINUTES -delete 2>/dev/null || true\n'
+        "  fi\n"
+        '  if compgen -G "$CLIENTS/*" > /dev/null; then\n'
+        "    last_seen=$now\n"
+        '  elif [ "$IDLE_TIMEOUT" -gt 0 ] && [ $((now - last_seen)) -ge "$IDLE_TIMEOUT" ]; then\n'
+        '    echo "idle timeout" >> "$SESSION_DIR/monitor.log"\n'
+        "    exit 0\n"
+        "  fi\n"
+        "  sleep 10\n"
+        "done\n"
+    )
+
+
+def submit_persistent_job(salloc_args, session_dir, idle_timeout, stale_seconds, job_name):
+    os.makedirs(session_dir, exist_ok=True)
+    script = build_idle_monitor_script(session_dir, idle_timeout, stale_seconds)
+    cmd = ["sbatch", "--parsable"]
+    if job_name:
+        cmd.append(f"--job-name={job_name}")
+    if salloc_args:
+        cmd.extend(salloc_args)
+    cmd.extend(["--wrap", f"bash -lc {shlex.quote(script)}"])
+    logging.debug('Submitting persistent job: "%s"', " ".join(cmd))
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "sbatch failed")
+    output = result.stdout.strip()
+    job_id = output.split(";")[0] if output else ""
+    if not job_id:
+        raise RuntimeError("sbatch did not return a job id")
+    return job_id
+
+
+def ensure_persistent_job(salloc_args, session_key):
+    paths = get_session_paths(session_key)
+    safe_key = paths["safe_key"]
+    namespaced = paths["namespaced"]
+    legacy = paths["legacy"]
+
+    def try_existing(path_info, label):
+        with file_lock(path_info["lock_path"]):
+            state = read_job_state(path_info["job_path"])
+            if state and is_job_alive(state.get("job_id")):
+                job_id = state.get("job_id")
+                logging.info(
+                    "Reusing persistent Slurm job %s for session %s (%s)",
+                    job_id,
+                    safe_key,
+                    label,
+                )
+                return job_id
+        return None
+
+    job_id = try_existing(namespaced, "namespaced")
+    if job_id:
+        return job_id, namespaced
+
+    job_id = try_existing(legacy, "legacy")
+    if job_id:
+        return job_id, legacy
+
+    with file_lock(namespaced["lock_path"]):
+        state = read_job_state(namespaced["job_path"])
+        if state and is_job_alive(state.get("job_id")):
+            job_id = state.get("job_id")
+            logging.info("Reusing persistent Slurm job %s for session %s (namespaced)", job_id, safe_key)
+            return job_id, namespaced
+        job_id = submit_persistent_job(
+            salloc_args,
+            namespaced["session_dir"],
+            cliArgs.sessionIdleTimeout,
+            cliArgs.sessionStaleSeconds,
+            cliArgs.sessionJobName,
+        )
+        write_job_state(
+            namespaced["job_path"],
+            {
+                "job_id": job_id,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "args": salloc_args or [],
+                "session_key": safe_key,
+                "job_name": cliArgs.sessionJobName or "",
+            },
+        )
+        logging.info("Started persistent Slurm job %s for session %s (namespaced)", job_id, safe_key)
+        return job_id, namespaced
+
+
+def start_session_marker(clients_dir, heartbeat_seconds):
+    os.makedirs(clients_dir, exist_ok=True)
+    marker_name = f"{os.getpid()}.{uuid.uuid4().hex}"
+    marker_path = os.path.join(clients_dir, marker_name)
+    with open(marker_path, "w") as handle:
+        handle.write(str(time.time()))
+    stop_event = threading.Event()
+
+    def heartbeat():
+        while not stop_event.wait(heartbeat_seconds):
+            try:
+                os.utime(marker_path, None)
+            except FileNotFoundError:
+                break
+
+    thread = threading.Thread(name="Session-Heartbeat", target=heartbeat, daemon=True)
+    thread.start()
+    return marker_path, stop_event
+
+
 async def runloop():
-    """The main asyncio event loop for this script.  Starts the TCP port proxy so it will be awaiting a startup signal (once the remote hostname and TCP port are known).  Launches the remote shell with Slurm `salloc` and connects its stdio channels to threaded i/o handlers.  The function then goes to sleep until the program state reaches END, then cleans-up the remote shell subprocess and TCP proxy runloop before exiting."""
+    """The main asyncio event loop for this script.  Starts the TCP port proxy so it will be awaiting a startup signal (once the remote hostname and TCP port are known).  Launches the remote shell via Slurm and connects its stdio channels to threaded i/o handlers.  The function then goes to sleep until the program state reaches END, then cleans-up the remote shell subprocess and TCP proxy runloop before exiting."""
     global proxyState, proxyStateCond, cliArgs, teeFiles
 
     logging.debug("Runloop start")
@@ -439,10 +728,39 @@ async def runloop():
     )
     proxyThread.start()
 
+    session_marker = None
+    session_stop = None
+
     # Start the remote shell:
-    remoteShellCmd = ["salloc"]
-    if cliArgs.sallocArgs:
-        remoteShellCmd.extend(cliArgs.sallocArgs)
+    if cliArgs.sessionMode == "persistent":
+        job_id, session_paths = ensure_persistent_job(
+            cliArgs.sallocArgs or [], cliArgs.sessionKey
+        )
+        session_dir = session_paths["session_dir"]
+        clients_dir = session_paths["clients_dir"]
+        os.makedirs(clients_dir, exist_ok=True)
+        if not wait_for_job_running(job_id, cliArgs.sessionWaitSeconds):
+            logging.error("Persistent job %s is not ready; exiting.", job_id)
+            return
+        heartbeat_seconds = int(cliArgs.sessionHeartbeatSeconds)
+        if heartbeat_seconds <= 0:
+            heartbeat_seconds = DEFAULT_SESSION_HEARTBEAT_SECONDS
+        session_marker, session_stop = start_session_marker(
+            clients_dir, heartbeat_seconds
+        )
+        remoteShellCmd = [
+            "srun",
+            "--jobid",
+            str(job_id),
+            "--overlap",
+            "bash",
+            "-l",
+        ]
+        logging.info("Using persistent allocation job %s", job_id)
+    else:
+        remoteShellCmd = ["salloc"]
+        if cliArgs.sallocArgs:
+            remoteShellCmd.extend(cliArgs.sallocArgs)
     logging.debug('Command to launch remote shell: "%s"', " ".join(remoteShellCmd))
     remoteShellProc = subprocess.Popen(
         remoteShellCmd,
@@ -488,6 +806,14 @@ async def runloop():
         remoteShellProc.wait(timeout=10)
     except:
         remoteShellProc.kill()
+
+    if session_stop is not None:
+        session_stop.set()
+    if session_marker:
+        try:
+            os.remove(session_marker)
+        except FileNotFoundError:
+            pass
 
     # Terminate the TCP proxy event loop:
     logging.debug("Terminating TCP proxy event loop...")
@@ -613,8 +939,70 @@ cliParser.add_argument(
     action="append",
     help="used zero or more times to specify arguments to the salloc command being wrapped (e.g. --partition=<name>, --ntasks=<N>)",
 )
+cliParser.add_argument(
+    "--session-mode",
+    dest="sessionMode",
+    choices=["ephemeral", "persistent"],
+    default="ephemeral",
+    help="allocation mode for the Slurm session (default ephemeral)",
+)
+cliParser.add_argument(
+    "--session-key",
+    dest="sessionKey",
+    default="",
+    help="identifier for persistent sessions (default: derived from alias)",
+)
+cliParser.add_argument(
+    "--session-idle-timeout",
+    dest="sessionIdleTimeout",
+    default=DEFAULT_SESSION_IDLE_TIMEOUT,
+    type=int,
+    help="seconds of idle time before a persistent allocation is cancelled (default 0 = never)",
+)
+cliParser.add_argument(
+    "--session-state-dir",
+    dest="sessionStateDir",
+    default=DEFAULT_SESSION_STATE_DIR,
+    help="base directory for persistent session state (default ~/.slurm-connect)",
+)
+cliParser.add_argument(
+    "--session-heartbeat-seconds",
+    dest="sessionHeartbeatSeconds",
+    default=DEFAULT_SESSION_HEARTBEAT_SECONDS,
+    type=int,
+    help="heartbeat interval in seconds for session markers (default 30)",
+)
+cliParser.add_argument(
+    "--session-stale-seconds",
+    dest="sessionStaleSeconds",
+    default=DEFAULT_SESSION_STALE_SECONDS,
+    type=int,
+    help="consider session markers stale after this many seconds (default 90)",
+)
+cliParser.add_argument(
+    "--session-job-name",
+    dest="sessionJobName",
+    default=DEFAULT_SESSION_JOB_NAME,
+    help="job name for persistent allocations (default slurm-connect)",
+)
+cliParser.add_argument(
+    "--session-wait-seconds",
+    dest="sessionWaitSeconds",
+    default=DEFAULT_SESSION_WAIT_SECONDS,
+    type=int,
+    help="seconds to wait for a persistent allocation to start before failing (default 300)",
+)
 
 cliArgs = cliParser.parse_args()
+cliArgs.sessionMode = normalize_session_mode(cliArgs.sessionMode)
+if cliArgs.sessionIdleTimeout < 0:
+    cliArgs.sessionIdleTimeout = DEFAULT_SESSION_IDLE_TIMEOUT
+if cliArgs.sessionHeartbeatSeconds <= 0:
+    cliArgs.sessionHeartbeatSeconds = DEFAULT_SESSION_HEARTBEAT_SECONDS
+if cliArgs.sessionStaleSeconds < 0:
+    cliArgs.sessionStaleSeconds = DEFAULT_SESSION_STALE_SECONDS
+if cliArgs.sessionWaitSeconds < 0:
+    cliArgs.sessionWaitSeconds = DEFAULT_SESSION_WAIT_SECONDS
 
 # Figure the logging level:
 chosenLoggingLevel = min(
