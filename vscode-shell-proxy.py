@@ -541,6 +541,96 @@ def query_job_state(job_id):
     return match.group(1).upper() if match else None
 
 
+def query_job_nodelist(job_id):
+    if not job_id:
+        return None
+    result = subprocess.run(
+        ["squeue", "-h", "-j", str(job_id), "-o", "%N"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        output = result.stdout.strip()
+        if output:
+            line = output.splitlines()[0].strip()
+            if line and line not in {"(null)", "None", "N/A"}:
+                return line
+
+    result = subprocess.run(
+        ["scontrol", "show", "job", "-o", str(job_id)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = re.search(r"NodeList=([^\s]+)", result.stdout)
+    if match:
+        return match.group(1)
+    match = re.search(r"BatchHost=([^\s]+)", result.stdout)
+    if match:
+        return match.group(1)
+    return None
+
+
+def expand_nodelist(nodelist):
+    if not nodelist:
+        return []
+    result = subprocess.run(
+        ["scontrol", "show", "hostnames", nodelist],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        hosts = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if hosts:
+            return hosts
+
+    if "[" not in nodelist and "," not in nodelist:
+        return [nodelist]
+
+    match = re.match(r"^([A-Za-z0-9._-]+)\[([^\]]+)\].*$", nodelist)
+    if not match:
+        return []
+    prefix = match.group(1)
+    body = match.group(2)
+    first_chunk = body.split(",")[0].strip()
+    if not first_chunk:
+        return []
+    first_value = first_chunk.split("-")[0].strip()
+    if not first_value:
+        return []
+    return [f"{prefix}{first_value}"]
+
+
+def resolve_persistent_node(job_id, session_paths):
+    nodelist = query_job_nodelist(job_id)
+    nodes = expand_nodelist(nodelist)
+    if not nodes:
+        logging.warning("Unable to determine node list for job %s.", job_id)
+        return None
+
+    job_path = session_paths["job_path"]
+    lock_path = session_paths["lock_path"]
+    selected = None
+    with file_lock(lock_path):
+        state = read_job_state(job_path) or {}
+        preferred = state.get("node")
+        if preferred and preferred in nodes:
+            selected = preferred
+        else:
+            selected = nodes[0]
+            if selected != preferred:
+                state["node"] = selected
+                if not state.get("job_id"):
+                    state["job_id"] = job_id
+                write_job_state(job_path, state)
+    logging.info("Using persistent node %s for job %s", selected, job_id)
+    return selected
+
+
 def is_job_alive(job_id):
     state = query_job_state(job_id)
     if not state:
@@ -742,6 +832,7 @@ async def runloop():
         if not wait_for_job_running(job_id, cliArgs.sessionWaitSeconds):
             logging.error("Persistent job %s is not ready; exiting.", job_id)
             return
+        persistent_node = resolve_persistent_node(job_id, session_paths)
         heartbeat_seconds = int(cliArgs.sessionHeartbeatSeconds)
         if heartbeat_seconds <= 0:
             heartbeat_seconds = DEFAULT_SESSION_HEARTBEAT_SECONDS
@@ -753,9 +844,12 @@ async def runloop():
             "--jobid",
             str(job_id),
             "--overlap",
-            "bash",
-            "-l",
+            "--nodes=1",
+            "--ntasks=1",
         ]
+        if persistent_node:
+            remoteShellCmd.extend(["--nodelist", persistent_node])
+        remoteShellCmd.extend(["bash", "-l"])
         logging.info("Using persistent allocation job %s", job_id)
     else:
         remoteShellCmd = ["salloc"]
