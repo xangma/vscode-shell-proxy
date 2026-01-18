@@ -451,6 +451,17 @@ def sanitize_session_key(value):
     return sanitized[:64]
 
 
+def sanitize_client_id(value):
+    trimmed = (value or "").strip()
+    if not trimmed:
+        return ""
+    sanitized = sessionKeySanitizeRegex.sub("-", trimmed).strip(".-")
+    if not sanitized:
+        return ""
+    sanitized = sanitized.replace(".", "-")
+    return sanitized[:64]
+
+
 def resolve_state_dir(value):
     base = value or DEFAULT_SESSION_STATE_DIR
     return os.path.abspath(os.path.expanduser(base))
@@ -685,11 +696,13 @@ def build_idle_monitor_script(session_dir, idle_timeout, stale_seconds):
         "set -euo pipefail\n"
         f"SESSION_DIR={safe_dir}\n"
         'CLIENTS="$SESSION_DIR/clients"\n'
+        'LAST_SEEN="$SESSION_DIR/last_seen"\n'
         f"IDLE_TIMEOUT={idle_value}\n"
         f"STALE_SECONDS={stale_value}\n"
         'STALE_MINUTES=$(( (STALE_SECONDS + 59) / 60 ))\n'
         'mkdir -p "$CLIENTS"\n'
         "last_seen=$(date +%s)\n"
+        'echo "$last_seen" > "$LAST_SEEN"\n'
         "while true; do\n"
         "  now=$(date +%s)\n"
         '  if [ "$STALE_SECONDS" -gt 0 ] && [ "$STALE_MINUTES" -gt 0 ]; then\n'
@@ -697,6 +710,7 @@ def build_idle_monitor_script(session_dir, idle_timeout, stale_seconds):
         "  fi\n"
         '  if compgen -G "$CLIENTS/*" > /dev/null; then\n'
         "    last_seen=$now\n"
+        '    echo "$last_seen" > "$LAST_SEEN"\n'
         '  elif [ "$IDLE_TIMEOUT" -gt 0 ] && [ $((now - last_seen)) -ge "$IDLE_TIMEOUT" ]; then\n'
         '    echo "idle timeout" >> "$SESSION_DIR/monitor.log"\n'
         "    exit 0\n"
@@ -787,15 +801,20 @@ def ensure_persistent_job(salloc_args, session_key):
                 "args": salloc_args or [],
                 "session_key": safe_key,
                 "job_name": cliArgs.sessionJobName or "",
+                "idle_timeout_seconds": int(cliArgs.sessionIdleTimeout),
+                "stale_seconds": int(cliArgs.sessionStaleSeconds),
+                "heartbeat_seconds": int(cliArgs.sessionHeartbeatSeconds),
             },
         )
         logging.info("Started persistent Slurm job %s for session %s (namespaced)", job_id, safe_key)
         return job_id, namespaced
 
 
-def start_session_marker(clients_dir, heartbeat_seconds):
+def start_session_marker(clients_dir, heartbeat_seconds, client_id=None):
     os.makedirs(clients_dir, exist_ok=True)
-    marker_name = f"{os.getpid()}.{uuid.uuid4().hex}"
+    client_tag = sanitize_client_id(client_id)
+    prefix = f"client-{client_tag}" if client_tag else str(os.getpid())
+    marker_name = f"{prefix}.{os.getpid()}.{uuid.uuid4().hex}"
     marker_path = os.path.join(clients_dir, marker_name)
     with open(marker_path, "w") as handle:
         handle.write(str(time.time()))
@@ -849,7 +868,7 @@ async def runloop():
         if heartbeat_seconds <= 0:
             heartbeat_seconds = DEFAULT_SESSION_HEARTBEAT_SECONDS
         session_marker, session_stop = start_session_marker(
-            clients_dir, heartbeat_seconds
+            clients_dir, heartbeat_seconds, cliArgs.sessionClientId
         )
         remoteShellCmd = [
             "srun",
@@ -1057,6 +1076,12 @@ cliParser.add_argument(
     dest="sessionKey",
     default="",
     help="identifier for persistent sessions (default: derived from alias)",
+)
+cliParser.add_argument(
+    "--session-client-id",
+    dest="sessionClientId",
+    default="",
+    help="identifier for a VS Code client window (used for client counting)",
 )
 cliParser.add_argument(
     "--session-idle-timeout",
