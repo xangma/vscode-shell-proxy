@@ -810,8 +810,31 @@ def ensure_persistent_job(salloc_args, session_key):
         return job_id, namespaced
 
 
-def start_session_marker(clients_dir, heartbeat_seconds, client_id=None):
+def prune_stale_markers(clients_dir, stale_seconds):
+    if not stale_seconds or stale_seconds <= 0:
+        return
+    now = time.time()
+    try:
+        for name in os.listdir(clients_dir):
+            path = os.path.join(clients_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                age = now - os.path.getmtime(path)
+            except Exception:
+                continue
+            if age > stale_seconds:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def start_session_marker(clients_dir, heartbeat_seconds, client_id=None, stale_seconds=None):
     os.makedirs(clients_dir, exist_ok=True)
+    prune_stale_markers(clients_dir, stale_seconds)
     client_tag = sanitize_client_id(client_id)
     prefix = f"client-{client_tag}" if client_tag else str(os.getpid())
     marker_name = f"{prefix}.{os.getpid()}.{uuid.uuid4().hex}"
@@ -868,7 +891,7 @@ async def runloop():
         if heartbeat_seconds <= 0:
             heartbeat_seconds = DEFAULT_SESSION_HEARTBEAT_SECONDS
         session_marker, session_stop = start_session_marker(
-            clients_dir, heartbeat_seconds, cliArgs.sessionClientId
+            clients_dir, heartbeat_seconds, cliArgs.sessionClientId, cliArgs.sessionStaleSeconds
         )
         remoteShellCmd = [
             "srun",
