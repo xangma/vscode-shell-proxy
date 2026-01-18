@@ -712,6 +712,18 @@ def submit_persistent_job(salloc_args, session_dir, idle_timeout, stale_seconds,
     cmd = ["sbatch", "--parsable"]
     if job_name:
         cmd.append(f"--job-name={job_name}")
+    def has_flag(args, flags):
+        for arg in args:
+            if arg in flags:
+                return True
+            for flag in flags:
+                if arg.startswith(flag + "="):
+                    return True
+        return False
+    if not has_flag(salloc_args or [], ["--output", "-o"]):
+        cmd.append(f"--output={os.path.join(session_dir, 'slurm-%j.out')}")
+    if not has_flag(salloc_args or [], ["--error", "-e"]):
+        cmd.append(f"--error={os.path.join(session_dir, 'slurm-%j.err')}")
     if salloc_args:
         cmd.extend(salloc_args)
     cmd.extend(["--wrap", f"bash -lc {shlex.quote(script)}"])
